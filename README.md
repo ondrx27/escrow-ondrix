@@ -153,4 +153,5 @@ solana program show 6wed4KmcmSteExiur2gkyfDNgkwzUg77tadgX1x3tWSE --url devnet
 - ✅ Time-lock mechanism tested with 5-minute duration
 - ✅ 50/50 fund distribution working correctly
 
-<img width="1024" height="1024" alt="file_000000000c9c61f79986adaf04a075e6" src="https://github.com/user-attachments/assets/008569f0-1f94-4bb8-b099-88fe8eb00db7" />
+<img width="1024" height="1024" alt="image" src="https://github.com/user-attachments/assets/4800311c-1e75-43df-b9a9-1eda271efc6f" />
+
