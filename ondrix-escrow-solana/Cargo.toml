@@ -1,0 +1,16 @@
+[package]
+name = "ondrix-escrow-solana"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = "=1.18"
+thiserror = "=2.0"
+spl-token = { version = "=4.0", default-features = false, features = ["no-entrypoint"] }
+arrayref = "=0.3"
+spl-associated-token-account = { version = "=3.0", features = ["no-entrypoint"] }
+borsh = "=1.5"
+chainlink_solana = "=1.0.0"

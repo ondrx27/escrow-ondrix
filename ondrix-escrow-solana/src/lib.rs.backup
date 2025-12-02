@@ -1,0 +1,606 @@
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    clock::Clock,
+    entrypoint,
+    entrypoint::ProgramResult,
+    msg,
+    program::{invoke, invoke_signed},
+    program_error::ProgramError,
+    pubkey::Pubkey,
+    rent::{self, Rent},
+    sysvar::Sysvar,
+};
+use spl_token::instruction::transfer;
+use borsh::{BorshDeserialize, BorshSerialize};
+use thiserror::Error;
+use arrayref::array_ref;
+
+// Chainlink Oracle Program ID
+pub const CHAINLINK_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
+    241, 75, 246, 90, 213, 107, 210, 186, 113, 94, 69, 116, 44, 35, 31, 39, 
+    214, 54, 33, 207, 91, 119, 143, 55, 193, 162, 72, 149, 29, 23, 86, 2
+]);
+
+// SOL/USD Price Feed on Devnet
+pub const SOL_USD_FEED: Pubkey = Pubkey::new_from_array([
+    120, 245, 122, 225, 25, 94, 140, 73, 122, 139, 224, 84, 173, 82, 173, 244, 
+    200, 151, 111, 132, 54, 115, 35, 9, 226, 42, 247, 6, 119, 36, 173, 150
+]);
+
+// Price constants
+pub const TOKEN_PRICE_USD: u64 = 10; // 0.1 USD = 10 cents per token
+pub const USD_DECIMALS: u8 = 8; // Chainlink uses 8 decimals for USD prices
+pub const TOKEN_DECIMALS: u8 = 6; // Standard token decimals
+
+#[derive(Error, Debug, Copy, Clone)]
+pub enum EscrowError {
+    #[error("Invalid instruction")]
+    InvalidInstruction,
+    #[error("Not rent exempt")]
+    NotRentExempt,
+    #[error("Expected amount mismatch")]
+    ExpectedAmountMismatch,
+    #[error("Amount overflow")]
+    AmountOverflow,
+    #[error("Invalid escrow status")]
+    InvalidEscrowStatus,
+    #[error("Unauthorized investor")]
+    UnauthorizedInvestor,
+    #[error("Tokens are still locked")]
+    TokensStillLocked,
+    #[error("No tokens available to claim")]
+    NoTokensToClaim,
+    #[error("Invalid price feed")]
+    InvalidPriceFeed,
+    #[error("Stale price data")]
+    StalePriceData,
+    #[error("Insufficient SOL deposit")]
+    InsufficientSolDeposit,
+}
+
+impl From<EscrowError> for ProgramError {
+    fn from(e: EscrowError) -> Self {
+        ProgramError::Custom(e as u32)
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq)]
+pub enum GlobalEscrowStatus {
+    Uninitialized,
+    Initialized,
+    Active,
+    Completed,
+}
+
+impl Default for GlobalEscrowStatus {
+    fn default() -> Self {
+        GlobalEscrowStatus::Uninitialized
+    }
+}
+
+// Global escrow account - one per program/token mint
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
+pub struct GlobalEscrow {
+    pub is_initialized: bool,
+    pub initializer_pubkey: Pubkey,
+    pub token_mint_pubkey: Pubkey,
+    pub recipient_wallet: Pubkey,
+    pub total_tokens_available: u64,
+    pub tokens_sold: u64,
+    pub total_sol_deposited: u64,
+    pub total_sol_withdrawn: u64,
+    pub lock_duration: i64,
+    pub bump_seed: u8,
+}
+
+impl GlobalEscrow {
+    pub const LEN: usize = 1 + 32 + 32 + 32 + 8 + 8 + 8 + 8 + 8 + 1;
+}
+
+// Per-investor account - one per investor
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
+pub struct InvestorAccount {
+    pub is_initialized: bool,
+    pub investor_pubkey: Pubkey,
+    pub global_escrow_pubkey: Pubkey,
+    pub sol_deposited: u64,
+    pub sol_locked_amount: u64,     // 50% of deposited SOL that's locked
+    pub tokens_received: u64,       // All tokens received immediately
+    pub sol_withdrawn: u64,         // Amount of locked SOL withdrawn by initializer
+    pub deposit_timestamp: i64,
+    pub sol_usd_price: u64,        // SOL price at deposit time
+    pub status: InvestorStatus,
+    pub bump_seed: u8,
+}
+
+impl InvestorAccount {
+    pub const LEN: usize = 1 + 32 + 32 + 8 + 8 + 8 + 8 + 8 + 8 + 1 + 1;
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq)]
+pub enum InvestorStatus {
+    Uninitialized,
+    Deposited,
+    SolWithdrawn,
+}
+
+impl Default for InvestorStatus {
+    fn default() -> Self {
+        InvestorStatus::Uninitialized
+    }
+}
+
+// PDA helper functions
+pub fn find_global_escrow_pda(
+    initializer: &Pubkey,
+    token_mint: &Pubkey,
+    program_id: &Pubkey,
+) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[b"global_escrow", initializer.as_ref(), token_mint.as_ref()],
+        program_id,
+    )
+}
+
+pub fn find_investor_pda(
+    investor: &Pubkey,
+    global_escrow: &Pubkey,
+    program_id: &Pubkey,
+) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[b"investor", investor.as_ref(), global_escrow.as_ref()],
+        program_id,
+    )
+}
+
+pub fn find_token_vault_pda(
+    global_escrow: &Pubkey,
+    program_id: &Pubkey,
+) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[b"token_vault", global_escrow.as_ref()],
+        program_id,
+    )
+}
+
+// Chainlink price feed data structure
+#[derive(Clone, Copy, Debug)]
+pub struct ChainlinkFeed {
+    pub price: i64,
+    pub decimals: u8,
+    pub timestamp: u64,
+}
+
+impl ChainlinkFeed {
+    // Simplified version - in production use chainlink-solana crate
+    pub fn load(account_info: &AccountInfo) -> Result<Self, ProgramError> {
+        let data = account_info.try_borrow_data()?;
+        
+        if data.len() < 32 {
+            return Err(EscrowError::InvalidPriceFeed.into());
+        }
+        
+        // TODO: Use official chainlink-solana library for proper parsing
+        // This is a placeholder implementation
+        let price_bytes = array_ref![data, 8, 8];
+        let price = i64::from_le_bytes(*price_bytes);
+        
+        let decimals = USD_DECIMALS; // Chainlink USD feeds use 8 decimals
+        
+        let timestamp_bytes = array_ref![data, 20, 8];
+        let timestamp = u64::from_le_bytes(*timestamp_bytes);
+        
+        Ok(ChainlinkFeed {
+            price,
+            decimals,
+            timestamp,
+        })
+    }
+    
+    pub fn is_stale(&self, max_age_seconds: u64) -> bool {
+        let current_timestamp = Clock::get().unwrap().unix_timestamp as u64;
+        current_timestamp > self.timestamp + max_age_seconds
+    }
+}
+
+// Helper function to calculate tokens based on SOL amount and USD price
+pub fn calculate_tokens_for_sol(
+    sol_amount_lamports: u64,
+    sol_usd_price: u64, // Price with 8 decimals
+) -> Result<u64, ProgramError> {
+    // Convert lamports to SOL (9 decimals)
+    let sol_amount = sol_amount_lamports;
+    
+    // Calculate USD value: SOL * SOL_USD_PRICE
+    // sol_amount (lamports) * sol_usd_price (8 decimals) / 10^9 = USD value (8 decimals)
+    let usd_value = (sol_amount as u128)
+        .checked_mul(sol_usd_price as u128)
+        .ok_or(EscrowError::AmountOverflow)?
+        .checked_div(1_000_000_000) // Convert lamports to SOL
+        .ok_or(EscrowError::AmountOverflow)? as u64;
+    
+    // Calculate tokens: USD_VALUE / TOKEN_PRICE_USD
+    // usd_value (8 decimals) / TOKEN_PRICE_USD (cents) * 10^(TOKEN_DECIMALS + 2) / 10^8
+    let tokens = (usd_value as u128)
+        .checked_mul(10_u128.pow(TOKEN_DECIMALS as u32 + 2)) // Add 2 for cents to dollars
+        .ok_or(EscrowError::AmountOverflow)?
+        .checked_div(TOKEN_PRICE_USD as u128) // TOKEN_PRICE_USD is in cents (0.1 USD = 10 cents)
+        .ok_or(EscrowError::AmountOverflow)?
+        .checked_div(10_u128.pow(USD_DECIMALS as u32)) // Remove USD decimals
+        .ok_or(EscrowError::AmountOverflow)? as u64;
+    
+    Ok(tokens)
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
+pub enum EscrowInstruction {
+    /// Initializes a new escrow
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The initializer account
+    /// 1. `[writable]` The escrow account to create
+    /// 2. `[]` The token mint account
+    /// 3. `[writable]` The escrow token vault (to be funded)
+    /// 4. `[signer, writable]` The token source account (for funding vault)
+    /// 5. `[]` The recipient wallet (receives 50% SOL)
+    /// 6. `[]` The token program
+    /// 7. `[]` The rent sysvar
+    InitializeEscrow {
+        token_amount: u64,
+        lock_duration: i64,
+    },
+    
+    /// Deposits SOL, sends 50% to recipient, locks 50%, gives ALL tokens to buyer
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer, writable]` The investor account
+    /// 1. `[writable]` The escrow account
+    /// 2. `[writable]` The escrow token vault
+    /// 3. `[writable]` The investor token account
+    /// 4. `[writable]` The recipient wallet (receives 50% SOL)
+    /// 5. `[]` The token program
+    /// 6. `[]` The SOL/USD price feed account
+    /// 7. `[]` The system program
+    /// 8. `[]` The clock sysvar
+    DepositSol {
+        sol_amount: u64,
+    },
+    
+    /// Withdraws locked SOL after lock period expires
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The authorized withdrawer (could be recipient or admin)
+    /// 1. `[writable]` The escrow account
+    /// 2. `[writable]` The destination account for SOL
+    /// 3. `[]` The system program
+    /// 4. `[]` The clock sysvar
+    WithdrawLockedSol,
+    
+    /// Gets escrow status
+    /// 
+    /// Accounts expected:
+    /// 0. `[]` The escrow account
+    /// 1. `[]` The clock sysvar
+    GetEscrowStatus,
+}
+
+entrypoint!(process_instruction);
+
+pub fn process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let instruction = EscrowInstruction::try_from_slice(instruction_data)
+        .map_err(|_| ProgramError::InvalidInstructionData)?;
+
+    match instruction {
+        EscrowInstruction::InitializeEscrow { token_amount, lock_duration } => {
+            msg!("Instruction: InitializeEscrow");
+            process_initialize_escrow(program_id, accounts, token_amount, lock_duration)
+        }
+        EscrowInstruction::DepositSol { sol_amount } => {
+            msg!("Instruction: DepositSol");
+            process_deposit_sol(program_id, accounts, sol_amount)
+        }
+        EscrowInstruction::WithdrawLockedSol => {
+            msg!("Instruction: WithdrawLockedSol");
+            process_withdraw_locked_sol(program_id, accounts)
+        }
+        EscrowInstruction::GetEscrowStatus => {
+            msg!("Instruction: GetEscrowStatus");
+            process_get_escrow_status(accounts)
+        }
+    }
+}
+
+pub fn process_initialize_escrow(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    token_amount: u64,
+    lock_duration: i64,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let initializer = next_account_info(account_info_iter)?;
+    let escrow_account = next_account_info(account_info_iter)?;
+    let token_mint = next_account_info(account_info_iter)?;
+    let escrow_token_vault = next_account_info(account_info_iter)?;
+    let token_source_account = next_account_info(account_info_iter)?;
+    let recipient_wallet = next_account_info(account_info_iter)?;
+    let token_program = next_account_info(account_info_iter)?;
+    let rent = &Rent::from_account_info(next_account_info(account_info_iter)?)?;
+
+    if !initializer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !rent.is_exempt(escrow_account.lamports(), escrow_account.data_len()) {
+        return Err(EscrowError::NotRentExempt.into());
+    }
+
+    let mut escrow_info = EscrowAccount::try_from_slice(&escrow_account.data.borrow())?;
+    
+    if escrow_info.is_initialized {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+
+    // Transfer tokens to escrow vault
+    let transfer_instruction = transfer(
+        token_program.key,
+        token_source_account.key,
+        escrow_token_vault.key,
+        initializer.key,
+        &[],
+        token_amount,
+    )?;
+
+    invoke(
+        &transfer_instruction,
+        &[
+            token_source_account.clone(),
+            escrow_token_vault.clone(),
+            initializer.clone(),
+            token_program.clone(),
+        ],
+    )?;
+
+    escrow_info = EscrowAccount {
+        is_initialized: true,
+        investor_pubkey: *initializer.key, // Will be updated on first deposit
+        token_mint_pubkey: *token_mint.key,
+        recipient_wallet: *recipient_wallet.key,
+        sol_deposited: 0,
+        sol_withdrawn: 0,
+        total_tokens_available: token_amount,
+        tokens_sold: 0,
+        deposit_timestamp: 0,
+        lock_duration,
+        sol_usd_price: 0,
+        status: EscrowStatus::Initialized,
+    };
+
+    escrow_info.serialize(&mut &mut escrow_account.data.borrow_mut()[..])?;
+
+    msg!(
+        "Escrow initialized with {} tokens, {} second lock, recipient: {}",
+        token_amount,
+        lock_duration,
+        recipient_wallet.key
+    );
+    Ok(())
+}
+
+pub fn process_deposit_sol(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    sol_amount: u64,
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let investor = next_account_info(account_info_iter)?;
+    let escrow_account = next_account_info(account_info_iter)?;
+    let escrow_token_vault = next_account_info(account_info_iter)?;
+    let investor_token_account = next_account_info(account_info_iter)?;
+    let recipient_wallet = next_account_info(account_info_iter)?;
+    let token_program = next_account_info(account_info_iter)?;
+    let price_feed_account = next_account_info(account_info_iter)?;
+    let system_program = next_account_info(account_info_iter)?;
+    let clock = &Clock::from_account_info(next_account_info(account_info_iter)?)?;
+
+    if !investor.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let mut escrow_info = EscrowAccount::try_from_slice(&escrow_account.data.borrow())?;
+    
+    if !escrow_info.is_initialized {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    if escrow_info.status != EscrowStatus::Initialized {
+        return Err(EscrowError::InvalidEscrowStatus.into());
+    }
+
+    // Validate recipient wallet matches
+    if recipient_wallet.key != &escrow_info.recipient_wallet {
+        return Err(EscrowError::InvalidPriceFeed.into()); // Reusing error for simplicity
+    }
+
+    // Validate price feed account
+    if price_feed_account.key != &SOL_USD_FEED {
+        return Err(EscrowError::InvalidPriceFeed.into());
+    }
+
+    // Load SOL/USD price from Chainlink feed
+    let price_feed = ChainlinkFeed::load(price_feed_account)?;
+    
+    // Check if price data is not too stale (max 1 hour)
+    if price_feed.is_stale(3600) {
+        return Err(EscrowError::StalePriceData.into());
+    }
+
+    // Calculate total tokens based on SOL amount and current price
+    let total_tokens = calculate_tokens_for_sol(sol_amount, price_feed.price as u64)?;
+    
+    if total_tokens == 0 {
+        return Err(EscrowError::InsufficientSolDeposit.into());
+    }
+
+    // Check if we have enough tokens in vault
+    if total_tokens > (escrow_info.total_tokens_available - escrow_info.tokens_sold) {
+        return Err(EscrowError::InsufficientSolDeposit.into()); // Reusing error
+    }
+
+    // Send 50% of SOL to recipient wallet immediately
+    let sol_to_recipient = sol_amount / 2;
+    let sol_to_lock = sol_amount - sol_to_recipient;
+
+    **recipient_wallet.try_borrow_mut_lamports()? += sol_to_recipient;
+    **investor.try_borrow_mut_lamports()? -= sol_to_recipient;
+
+    // Transfer remaining SOL to escrow (this will be locked)
+    **escrow_account.try_borrow_mut_lamports()? += sol_to_lock;
+    **investor.try_borrow_mut_lamports()? -= sol_to_lock;
+
+    // Find PDA seeds for escrow account (for token vault authority)
+    let (escrow_pda, bump_seed) = Pubkey::find_program_address(
+        &[b"escrow", &escrow_info.investor_pubkey.to_bytes()],
+        program_id,
+    );
+
+    if escrow_pda != *escrow_account.key {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let signers_seeds: &[&[&[u8]]] = &[&[b"escrow", &escrow_info.investor_pubkey.to_bytes(), &[bump_seed]]];
+
+    // Transfer ALL calculated tokens to investor immediately
+    let transfer_instruction = transfer(
+        token_program.key,
+        escrow_token_vault.key,
+        investor_token_account.key,
+        escrow_account.key,
+        &[],
+        total_tokens,
+    )?;
+
+    invoke_signed(
+        &transfer_instruction,
+        &[
+            escrow_token_vault.clone(),
+            investor_token_account.clone(),
+            escrow_account.clone(),
+            token_program.clone(),
+        ],
+        signers_seeds,
+    )?;
+
+    // Update escrow state with new calculated values
+    escrow_info.investor_pubkey = *investor.key; // Update with actual investor
+    escrow_info.sol_deposited += sol_amount;
+    escrow_info.tokens_sold += total_tokens;
+    escrow_info.deposit_timestamp = clock.unix_timestamp;
+    escrow_info.sol_usd_price = price_feed.price as u64;
+    escrow_info.status = EscrowStatus::Deposited;
+
+    escrow_info.serialize(&mut &mut escrow_account.data.borrow_mut()[..])?;
+
+    msg!(
+        "Deposited {} SOL at ${:.2}/SOL, sent {} SOL to recipient, locked {} SOL, gave {} tokens to buyer", 
+        sol_amount as f64 / 1_000_000_000.0,
+        price_feed.price as f64 / 100_000_000.0,
+        sol_to_recipient as f64 / 1_000_000_000.0,
+        sol_to_lock as f64 / 1_000_000_000.0,
+        total_tokens
+    );
+    Ok(())
+}
+
+pub fn process_withdraw_locked_sol(
+    _program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let withdrawer = next_account_info(account_info_iter)?;
+    let escrow_account = next_account_info(account_info_iter)?;
+    let destination_account = next_account_info(account_info_iter)?;
+    let _system_program = next_account_info(account_info_iter)?;
+    let clock = &Clock::from_account_info(next_account_info(account_info_iter)?)?;
+
+    if !withdrawer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let mut escrow_info = EscrowAccount::try_from_slice(&escrow_account.data.borrow())?;
+    
+    if !escrow_info.is_initialized {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    if escrow_info.status != EscrowStatus::Deposited {
+        return Err(EscrowError::InvalidEscrowStatus.into());
+    }
+
+    // Allow withdrawal by recipient or investor
+    if withdrawer.key != &escrow_info.recipient_wallet && withdrawer.key != &escrow_info.investor_pubkey {
+        return Err(EscrowError::UnauthorizedInvestor.into());
+    }
+
+    let current_timestamp = clock.unix_timestamp;
+    if current_timestamp < escrow_info.deposit_timestamp + escrow_info.lock_duration {
+        return Err(EscrowError::TokensStillLocked.into());
+    }
+
+    let locked_sol = escrow_account.lamports().saturating_sub(1_000_000); // ~1 SOL for rent exemption
+    let available_to_withdraw = locked_sol.saturating_sub(escrow_info.sol_withdrawn);
+    
+    if available_to_withdraw == 0 {
+        return Err(EscrowError::NoTokensToClaim.into()); // Reusing error
+    }
+
+    // Transfer locked SOL to destination
+    **destination_account.try_borrow_mut_lamports()? += available_to_withdraw;
+    **escrow_account.try_borrow_mut_lamports()? -= available_to_withdraw;
+
+    // Update escrow state
+    escrow_info.sol_withdrawn += available_to_withdraw;
+    escrow_info.status = EscrowStatus::Completed;
+
+    escrow_info.serialize(&mut &mut escrow_account.data.borrow_mut()[..])?;
+
+    msg!("Withdrew {} locked SOL to {}", available_to_withdraw, destination_account.key);
+    Ok(())
+}
+
+pub fn process_get_escrow_status(accounts: &[AccountInfo]) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let escrow_account = next_account_info(account_info_iter)?;
+    let clock = &Clock::from_account_info(next_account_info(account_info_iter)?)?;
+
+    let escrow_info = EscrowAccount::try_from_slice(&escrow_account.data.borrow())?;
+    
+    if !escrow_info.is_initialized {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    let current_timestamp = clock.unix_timestamp;
+    let unlock_timestamp = escrow_info.deposit_timestamp + escrow_info.lock_duration;
+    let is_unlocked = current_timestamp >= unlock_timestamp;
+    let locked_sol = escrow_account.lamports().saturating_sub(1_000_000); // ~1 SOL for rent exemption
+    let available_sol = locked_sol.saturating_sub(escrow_info.sol_withdrawn);
+
+    msg!("Escrow Status:");
+    msg!("  Status: {:?}", escrow_info.status);
+    msg!("  Recipient wallet: {}", escrow_info.recipient_wallet);
+    msg!("  SOL deposited: {} ({:.2} SOL)", escrow_info.sol_deposited, escrow_info.sol_deposited as f64 / 1_000_000_000.0);
+    msg!("  SOL price at deposit: ${:.2}", escrow_info.sol_usd_price as f64 / 100_000_000.0);
+    msg!("  Tokens available in vault: {}", escrow_info.total_tokens_available);
+    msg!("  Tokens sold: {}", escrow_info.tokens_sold);
+    msg!("  Locked SOL: {} ({:.2} SOL)", locked_sol, locked_sol as f64 / 1_000_000_000.0);
+    msg!("  SOL withdrawn: {} ({:.2} SOL)", escrow_info.sol_withdrawn, escrow_info.sol_withdrawn as f64 / 1_000_000_000.0);
+    msg!("  Available to withdraw: {} ({:.2} SOL)", available_sol, available_sol as f64 / 1_000_000_000.0);
+    msg!("  Deposit timestamp: {}", escrow_info.deposit_timestamp);
+    msg!("  Unlock timestamp: {}", unlock_timestamp);
+    msg!("  Is unlocked: {}", is_unlocked);
+
+    Ok(())
+}

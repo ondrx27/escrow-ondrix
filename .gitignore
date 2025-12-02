@@ -1,0 +1,6 @@
+
+ondrix-escrow-evm/package-lock.json
+/ondrix-escrow-solana/node_modules
+/escrow-frontend/dist
+/escrow-frontend/node_modules
+ondrix-escrow-evm/.env

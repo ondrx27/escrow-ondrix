@@ -1,0 +1,31 @@
+{
+  "name": "ondrix-escrow-evm",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy": "hardhat ignition deploy ignition/modules/OndrixEscrow.ts",
+    "deploy:bsc": "hardhat ignition deploy ignition/modules/OndrixEscrow.ts --network bsc",
+    "deploy:bsc-testnet": "hardhat ignition deploy ignition/modules/OndrixEscrow.ts --network bscTestnet"
+  },
+  "dependencies": {
+    "@chainlink/contracts": "^0.6.1",
+    "@openzeppelin/contracts": "^5.0.0"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-ignition": "^3.0.2",
+    "@nomicfoundation/hardhat-toolbox-mocha-ethers": "^3.0.0",
+    "@types/chai": "^4.3.20",
+    "@types/chai-as-promised": "^8.0.2",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^22.18.1",
+    "chai": "^5.3.3",
+    "dotenv": "^16.6.1",
+    "ethers": "^6.15.0",
+    "forge-std": "github:foundry-rs/forge-std#v1.9.4",
+    "hardhat": "^3.0.4",
+    "mocha": "^11.7.2",
+    "typescript": "~5.8.0"
+  }
+}

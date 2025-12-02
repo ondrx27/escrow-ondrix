@@ -1,0 +1,209 @@
+@import 'tailwindcss/base';
+@import 'tailwindcss/components';
+@import 'tailwindcss/utilities';
+
+/* Import Solana wallet adapter styles */
+@import '@solana/wallet-adapter-react-ui/styles.css';
+
+/* Global styles */
+@layer base {
+  * {
+    @apply border-border-dark;
+  }
+  
+  body {
+    @apply bg-bg-dark text-text-primary;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+/* Custom scrollbar */
+@layer utilities {
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: #00ff88 #1a1a1a;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-track {
+    @apply bg-bg-card rounded-full;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    @apply bg-accent-green rounded-full;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    @apply bg-accent-green-dark;
+  }
+}
+
+/* Animation classes */
+@layer components {
+  .animate-glow {
+    animation: glow 2s ease-in-out infinite alternate;
+  }
+
+  @keyframes glow {
+    from {
+      box-shadow: 0 0 5px theme('colors.accent-green');
+    }
+    to {
+      box-shadow: 0 0 20px theme('colors.accent-green'), 0 0 30px theme('colors.accent-green');
+    }
+  }
+
+  .gradient-text {
+    background: linear-gradient(135deg, #00ff88 0%, #33ffaa 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .btn-primary {
+    @apply bg-gradient-green text-white font-semibold py-3 px-6 rounded-lg transition-all duration-200 hover:shadow-lg hover:shadow-accent-green/25 hover:scale-105 focus:outline-none focus:ring-2 focus:ring-accent-green focus:ring-opacity-50;
+  }
+
+  .btn-secondary {
+    @apply bg-bg-card border border-border-green text-text-primary font-semibold py-3 px-6 rounded-lg transition-all duration-200 hover:bg-bg-hover hover:border-accent-green-light hover:text-accent-green-light focus:outline-none focus:ring-2 focus:ring-accent-green focus:ring-opacity-50;
+  }
+
+  .card {
+    @apply bg-bg-card border border-border-dark rounded-xl p-6 transition-all duration-200 hover:border-border-green/50;
+  }
+
+  .input-field {
+    @apply bg-bg-dark border border-border-dark rounded-lg px-4 py-3 text-text-primary placeholder-text-muted focus:border-accent-green focus:outline-none focus:ring-2 focus:ring-accent-green/20 transition-all duration-200;
+  }
+
+  .input {
+    @apply bg-bg-dark border border-border-dark rounded-lg px-4 py-3 text-text-primary placeholder-text-muted focus:border-accent-green focus:outline-none focus:ring-2 focus:ring-accent-green/20 transition-all duration-200 w-full;
+  }
+
+  .status-badge {
+    @apply inline-flex items-center px-3 py-1 rounded-full text-xs font-medium;
+  }
+
+  .status-success {
+    @apply bg-success/20 text-success border border-success/30;
+  }
+
+  .status-warning {
+    @apply bg-warning/20 text-warning border border-warning/30;
+  }
+
+  .status-error {
+    @apply bg-error/20 text-error border border-error/30;
+  }
+
+  .loading-pulse {
+    @apply animate-pulse bg-bg-hover rounded;
+  }
+}
+
+/* Wallet adapter overrides for dark theme */
+.wallet-adapter-dropdown {
+  @apply bg-bg-card border border-border-dark;
+}
+
+.wallet-adapter-dropdown-list {
+  @apply bg-bg-card border border-border-dark;
+}
+
+.wallet-adapter-dropdown-list-item {
+  @apply text-text-primary hover:bg-bg-hover;
+}
+
+.wallet-adapter-modal {
+  @apply bg-bg-card;
+}
+
+.wallet-adapter-modal-overlay {
+  @apply bg-black/80;
+}
+
+.wallet-adapter-modal-title {
+  @apply text-text-primary;
+}
+
+.wallet-adapter-modal-list-item {
+  @apply bg-bg-dark hover:bg-bg-hover border-border-dark;
+}
+
+.wallet-adapter-modal-list-item:hover {
+  @apply border-accent-green/50;
+}
+
+/* Fix for duplicate wallet entries */
+.wallet-adapter-modal-list-item[data-wallet-name] {
+  @apply relative;
+}
+
+/* Phantom wallet specific fixes */
+.wallet-adapter-button .wallet-adapter-icon {
+  @apply !w-5 !h-5;
+}
+
+/* Custom Solana Wallet Button Styles */
+.wallet-adapter-button-container .wallet-adapter-button {
+  @apply !min-w-[180px] !justify-center !rounded-lg !font-medium !text-white !transition-all !duration-200 !border-none !shadow-lg;
+  background: linear-gradient(135deg, #00ff88 0%, #33ffaa 100%) !important;
+}
+
+.wallet-adapter-button-container .wallet-adapter-button:not([disabled]):hover {
+  @apply !scale-105;
+  background: linear-gradient(135deg, rgba(0, 255, 136, 0.9) 0%, rgba(51, 255, 170, 0.9) 100%) !important;
+  box-shadow: 0 10px 25px rgba(0, 255, 136, 0.25) !important;
+}
+
+.wallet-adapter-button-container .wallet-adapter-button[disabled] {
+  @apply !opacity-50 !cursor-not-allowed !scale-100;
+}
+
+/* Custom animations */
+@keyframes slideInUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.animate-slide-in-up {
+  animation: slideInUp 0.5s ease-out forwards;
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.5s ease-out forwards;
+}
+
+/* Number counter animation */
+@keyframes countUp {
+  from {
+    transform: translateY(20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.animate-count-up {
+  animation: countUp 0.8s ease-out forwards;
+}
